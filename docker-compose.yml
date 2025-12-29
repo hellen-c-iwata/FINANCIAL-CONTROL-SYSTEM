@@ -1,0 +1,122 @@
+services:
+  # ----------------------------------------------------------------
+  # 1. Banco de Dados (Persistência)
+  # ----------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: pfm_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pfm_db_data:/var/lib/postgresql/data
+    networks:
+      - pfm_network
+    # Healthcheck: Garante que outros containers só iniciem quando o DB estiver PRONTO
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------
+  # 2. Cache & Message Broker
+  # ----------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: pfm_redis
+    restart: always
+    # REMOVIDO: ports: - "6379:6379" (Segurança: Acesso apenas interno)
+    networks:
+      - pfm_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ----------------------------------------------------------------
+  # 3. API Core (FastAPI/Django) - O cérebro síncrono
+  # ----------------------------------------------------------------
+  api:
+    build: . # Usa o Dockerfile raiz
+    container_name: pfm_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: always
+    volumes:
+      - .:/app # Hot-reload para desenvolvimento
+    ports:
+      - "8000:8000" # Porta da API exposta para o Frontend/Bot
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pfm_network
+
+  # ----------------------------------------------------------------
+  # 4. Worker (Celery) - O braço operacional (Tarefas pesadas)
+  # ----------------------------------------------------------------
+  worker:
+    build: .
+    container_name: pfm_worker
+    # Comando específico para consumir tarefas
+    command: celery -A app.celery_app worker --loglevel=info
+    restart: always
+    volumes:
+      - .:/app
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pfm_network
+
+  # ----------------------------------------------------------------
+  # 5. Beat (Celery) - O Relógio (Agendador de Cron)
+  # ----------------------------------------------------------------
+  beat:
+    build: .
+    container_name: pfm_beat
+    # O Beat agenda as tarefas recorrentes (ex: verificar dia 5, dia 20)
+    command: celery -A app.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
+    restart: always
+    volumes:
+      - .:/app
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - pfm_network
+
+  # ----------------------------------------------------------------
+  # 6. Telegram Bot (Interface)
+  # ----------------------------------------------------------------
+  # bot:
+  #   build: .
+  #   container_name: pfm_bot
+  #   command: python bot.py # Script de entrypoint do bot
+  #   restart: always
+  #   volumes:
+  #     - .:/app
+  #   env_file: .env
+  #   depends_on:
+  #     api:
+  #       # O Bot precisa da API de pé para fazer consultas
+  #       condition: service_started
+  #   networks:
+  #     - pfm_network
+
+volumes:
+  pfm_db_data:
+
+networks:
+  pfm_network:
+    driver: bridge
